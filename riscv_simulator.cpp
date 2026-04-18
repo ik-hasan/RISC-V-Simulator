@@ -6,11 +6,11 @@ struct Decoded {
     string op;                 // mnemonic
     int rd = -1, rs1 = -1, rs2 = -1;
     int imm = 0;               // for I/S/B types
-    string label;              // for B-type target (before patch)
+    string label;              // for branch instruction(BEQ). 
     int labelTarget = -1;     // resolved instruction index
     string raw;                // original line for pretty logs
 };
-// === Utilities ===
+// Utilities
 static inline bool isRegister(const string& t) {//t is register like x7
     return t.size() >= 2 && (t[0] == 'x' || t[0] == 'X');
 }
@@ -19,7 +19,7 @@ static inline int regIndex(const string& t) {//t is register like X10
     // expects like "x5"
     if (!isRegister(t)) return -1;
     int v = stoi(t.substr(1)); // x7 ko 7 bana diya
-    if (v < 0 || v > 31) return -1;
+    if (v < 0 || v > 31) return -1;//bcz in risc-v there are only 32 registers from x0 to x31
     return v;
 }
 
@@ -34,6 +34,7 @@ static inline string trim(string s) {
     return s.substr(l, r - l + 1);
 }
 
+//registers ko string se nikalkr separate vector me store.
 static inline vector<string> splitCSV(const string& args) {
     // split by commas, then trim each
     vector<string> out;
@@ -63,8 +64,8 @@ static bool parseOffsetBase(const string& tok, int& offset, int& baseReg) {
     return true;
 }
 
-// === Parser: first pass builds labels, second pass decodes ===
-vector<string> loadLines(const string& filename) {//load each line of of .s file to vector of string
+//each line of any .s file is loaded to lines vector
+vector<string> loadLines(const string& filename) {
     ifstream fin(filename);
     if (!fin) {
         cerr << "Error: cannot open " << filename << "\n";
@@ -72,7 +73,7 @@ vector<string> loadLines(const string& filename) {//load each line of of .s file
     }
     vector<string> lines;
     string s;
-    while (getline(fin, s)) {//jabtak line milta jaai .s me, tabtak push karte jaa
+    while (getline(fin, s)) {//jabtak line milta jaye .s me, tabtak push karte jaa
         lines.push_back(s);
     }
     return lines;
@@ -108,18 +109,16 @@ Program parseProgram(const string& filename) {
 
     // Second pass: decode instructions
     for (auto& line : onlyInstr) {
-        Decoded d; d.raw = line;
+        Decoded d; 
+        d.raw = line;
 
-        // op and rest
         string s = line;
-        // get opcode (till first space)
         string op;
         {
-            stringstream ss(s);
-            ss >> op;
+            stringstream ss(s);//get opcode or first word of instruction(ADD, BEQ etc.)
+            ss >> op; //store this opcode in op variable
         }
-        // uppercase op for uniformity
-        for (auto &c : op) c = toupper(c);
+        for (auto &c : op) c = toupper(c);//add -> ADD etc
         d.op = op;
 
         // get argument string (after opcode)
@@ -152,9 +151,10 @@ Program parseProgram(const string& filename) {
         } else if (op == "SW") {
             // SW rs2, offset(rs1)
             if (args.size() != 2) { cerr << "Bad SW: " << line << "\n"; exit(1); }
+            d.rs2 = regIndex(args[0]);
             int off, base; 
             if (!parseOffsetBase(args[1], off, base)) { cerr << "Bad SW addr: " << line << "\n"; exit(1); }
-            d.rs2 = regIndex(args[0]); d.rs1 = base; d.imm = off;
+            d.rs1 = base; d.imm = off;
             if (d.rs2 < 0 || d.rs1 < 0) { cerr << "Bad regs in: " << line << "\n"; exit(1); }
         } else if (op == "BEQ") {
             // BEQ rs1, rs2, label
@@ -175,6 +175,8 @@ Program parseProgram(const string& filename) {
     for (auto& d : P.code) {
         if (d.op == "BEQ") {
             if (!P.labelToIndex.count(d.label)) {
+                // BEQ x1, x0, skip
+                // lekin .s file me label skip: hai hi nhi, toh error de denge
                 cerr << "Undefined label: " << d.label << " used in: " << d.raw << "\n";
                 exit(1);
             }
@@ -184,15 +186,15 @@ Program parseProgram(const string& filename) {
     return P;
 }
 
-// === CPU core ===
+//CPU core and simulator
 struct CPU {
-    static const int MEM_SIZE = 1024; // words
+    static const int MEM_SIZE = 1024; // simple RAM (1024 words)
 
-    int32_t R[32]{};                  // register file
+    int32_t R[32]{};                  //32 registers of 32 bits
     vector<Decoded> code;             // instruction memory
     int PC = 0;                       // instruction index
     int64_t cycle = 0;                // cycle counter
-    int32_t MEM[MEM_SIZE]{};          // simple data memory
+    int32_t MEM[MEM_SIZE]{};          // 1024 memory blocks each of 32 bits
 
     // Temporary latches for multi-cycle (non-pipelined) execution:
     Decoded cur;          // current instruction (latched in IF/ID)
@@ -202,17 +204,19 @@ struct CPU {
 
     // Helpers
     void printRegs() {//print all register (that are changed)
-        cout << "Registers:\n";
+        cout << "All changed Registers\n";
         for (int i = 0; i < 32; ++i) {
-            if(R[i] != 0 ) { // maine add kiya taki emply registers na print ho.
+            if(R[i] != 0 ) { // maine add kiya taki empty registers na print ho.
                 cout << "x" << i << "=" << R[i] << ((i%8==7) ? "\n" : "\t");
             }
         }
     }
-    void printMem(int from=0, int to=7) {
-        cout << "Memory[words " << from << ".." << to << "]:\n";
-        for (int i = from; i <= to; ++i) {
-            cout << "[" << i << "]=" << MEM[i] << ((i%8==7) ? "\n" : "\t");
+    void printMem() {
+        cout << "All changed Memory locations [words 0..1023]\n";
+        for (int i = 0; i < 1024; ++i) {
+            if (MEM[i] != 0) { // only print non-zero values
+                cout << "[" << i << "]=" << MEM[i] << ((i%8==7) ? "\n" : "\t");
+            }
         }
     }
 
@@ -242,76 +246,104 @@ struct CPU {
 
     // Stage 3: EX
     void EX_stage() {
+
         cycle++;
         takeBranch = false;
+
         if (cur.op == "ADD") {
             aluOut = R[cur.rs1] + R[cur.rs2];
             cout << "Cycle " << cycle << ": EX  - ADD -> " << R[cur.rs1] << " + " << R[cur.rs2] << " = " << aluOut << "\n";
-        } else if (cur.op == "SUB") {
+        } 
+        
+        else if (cur.op == "SUB") {
             aluOut = R[cur.rs1] - R[cur.rs2];
             cout << "Cycle " << cycle << ": EX  - SUB -> " << R[cur.rs1] << " - " << R[cur.rs2] << " = " << aluOut << "\n";
-        } else if (cur.op == "ADDI") {
+        } 
+        
+        else if (cur.op == "ADDI") {
             aluOut = R[cur.rs1] + cur.imm;
             cout << "Cycle " << cycle << ": EX  - ADDI -> " << R[cur.rs1] << " + " << cur.imm << " = " << aluOut << "\n";
-        } else if (cur.op == "LW" || cur.op == "SW") {
-            // address = rs1 + imm ; use word index = addr/4
+        } 
+        
+        else if (cur.op == "LW" || cur.op == "SW") {
+            
             int addr = R[cur.rs1] + cur.imm;
+            //it is byte address, but our MEM is word-addressed, so we need to divide by 4 to get the word index
             int idx = addr / 4;
             aluOut = idx; // pass index to MEM stage
             cout << "Cycle " << cycle << ": EX  - Addr calc -> base=" << R[cur.rs1] << " + off=" << cur.imm
                  << " => byteAddr=" << addr << ", wordIdx=" << idx << "\n";
-        } else if (cur.op == "BEQ") {
+        } 
+        
+        else if (cur.op == "BEQ") {
             takeBranch = (R[cur.rs1] == R[cur.rs2]);
             cout << "Cycle " << cycle << ": EX  - BEQ compare: x" << cur.rs1 << "=" << R[cur.rs1]
                  << " ?= x" << cur.rs2 << "=" << R[cur.rs2]
                  << " -> " << (takeBranch ? "TAKE" : "NOT TAKE") << "\n";
-        } else {
+        } 
+        
+        else {
             cout << "Cycle " << cycle << ": EX  - (no-op)\n";
         }
     }
 
-    // Stage 4: MEM
+    // Stage 4: MEM sirf 2 instruction(LW, SW) ke liye memory access hota hai, baki instructions is stage me koi kaam nahi karti, toh unke liye hm no operation kar denge.
     void MEM_stage() {
+
         cycle++;
         if (cur.op == "LW") {
             if (aluOut < 0 || aluOut >= MEM_SIZE) {
                 cout << "Cycle " << cycle << ": MEM - LW OOB index=" << aluOut << " -> 0\n";
                 memOut = 0;
-            } else {
+            } 
+            else {
                 memOut = MEM[aluOut];
                 cout << "Cycle " << cycle << ": MEM - LW read MEM[" << aluOut << "]=" << memOut << "\n";
             }
-        } else if (cur.op == "SW") {
+        } 
+        
+        else if (cur.op == "SW") {
             if (aluOut < 0 || aluOut >= MEM_SIZE) {
                 cout << "Cycle " << cycle << ": MEM - SW OOB index=" << aluOut << " (ignored)\n";
-            } else {
+            } 
+            else {
                 MEM[aluOut] = R[cur.rs2];
                 cout << "Cycle " << cycle << ": MEM - SW write MEM[" << aluOut << "]=" << R[cur.rs2] << "\n";
             }
-        } else {
-            cout << "Cycle " << cycle << ": MEM - (no memory op)\n";
+        } 
+        
+        else {
+            cout << "Cycle " << cycle << ": MEM - (no memory operation)\n";
         }
     }
 
     // Stage 5: WB
     void WB_stage() {
+
         cycle++;
         if (cur.op == "ADD" || cur.op == "SUB" || cur.op == "ADDI") {
-            if (cur.rd != 0) R[cur.rd] = aluOut;  // x0 stays 0
+            if (cur.rd != 0) R[cur.rd] = aluOut;  //bcz x0 always stays 0
             cout << "Cycle " << cycle << ": WB  - x" << cur.rd << " = " << (cur.rd==0?0:aluOut) << "\n";
-        } else if (cur.op == "LW") {
+        } 
+        
+        else if (cur.op == "LW") {
             if (cur.rd != 0) R[cur.rd] = memOut;
             cout << "Cycle " << cycle << ": WB  - x" << cur.rd << " = " << (cur.rd==0?0:memOut) << "\n";
-        } else if (cur.op == "BEQ") {
-            // update PC on branch here (architecturally it's control, we model it after the WB for clarity)
+        } 
+        
+        else if (cur.op == "BEQ") {
+            
             if (takeBranch) {
                 cout << "Cycle " << cycle << ": WB  - Branch taken: PC <- " << cur.labelTarget << "\n";
                 PC = cur.labelTarget; // jump to label
                 return;
-            } else {
+            } 
+            else {
                 cout << "Cycle " << cycle << ": WB  - Branch not taken\n";
             }
-        } else {
+        } 
+        
+        else {
             cout << "Cycle " << cycle << ": WB  - (no writeback)\n";
         }
 
@@ -339,11 +371,13 @@ struct CPU {
     }
 };
 
-int main(int argc, char** argv) {
-    // ios::sync_with_stdio(false);
-    // cin.tie(nullptr);  //for fast i/o setup(optional hai)
+int main() {
 
-    string file = (argc >= 2 ? argv[1] : "simple.s");  // if run directly without specify ./a.exe simple.s, then it will run this file by default
+    string file ;
+    cout<<"\n\t\t=== RISC-V Simulator ===\n\n";
+
+    cout << "Enter the RISC-V assembly file to run (e.g., mini.s): ";
+    cin >> file;
     Program P = parseProgram(file);
 
     CPU cpu;
@@ -360,17 +394,18 @@ int main(int argc, char** argv) {
         } else {
             // header (optional)
             fout << "# reg value\n";
-            for (int i = 0; i < 8; ++i) {
-                fout << "x" << i << " " << cpu.R[i] << "\n";
+            for (int i = 0; i < 32; ++i) {
+                if (cpu.R[i] != 0)
+                    fout << "x" << i << " " << cpu.R[i] << "\n";
             }
             fout.close();
             cout << "\nWrote reg_values.dat for plotting.\n";
         }
     }
     cout << "\n--- Final State ---\n";
-    cpu.printRegs();
+    cpu.printRegs();// print all changed registers
     cout << "\n";
-    cpu.printMem(0, 7); // show first few words
+    cpu.printMem(); // print all non-zero memory locations
     return 0;
 }
 
